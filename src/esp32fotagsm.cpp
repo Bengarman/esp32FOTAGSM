@@ -12,15 +12,21 @@
 #include <Update.h>
 #include "ArduinoJson.h"
 
+#include "mbedtls/pk.h"
+#include "mbedtls/md.h"
+#include "mbedtls/md_internal.h"
+#include "esp_ota_ops.h"
+
 #if (!defined(SRC_TINYGSMCLIENT_H_))
-#define TINY_GSM_MODEM_SIM800
+#define TINY_GSM_MODEM_SIM7600
 #include <TinyGsmClient.h>
 #endif  // SRC_TINYGSMCLIENT_H_
 
-esp32FOTAGSM::esp32FOTAGSM(String firwmareType, int firwmareVersion)
+esp32FOTAGSM::esp32FOTAGSM(String firwmareType, int firwmareVersion, bool certCheck)
 {
     _firwmareType = firwmareType;
     _firwmareVersion = firwmareVersion;
+    _check_sig = certCheck;
     useDeviceID = false;
 }
 
@@ -34,6 +40,95 @@ static void splitHeader(String src, String &header, String &headerValue)
     headerValue.trim();
 
     return;
+}
+bool esp32FOTAGSM::validate_sig( unsigned char *signature, uint32_t firmware_size ) {
+    int ret = 1;
+    mbedtls_pk_context pk;
+    mbedtls_md_context_t rsa;
+
+    { // Open RSA public key:
+        
+        mbedtls_pk_init( &pk );
+        if( ( ret = mbedtls_pk_parse_public_key( &pk, ( uint8_t * ) checkPublicKey, sizeof( char ) + strlen( ( const char * ) checkPublicKey ) ) ) != 0 ) {
+            Serial.println( "Reading public key failed\n  ! mbedtls_pk_parse_public_key \n\n");
+            return false;
+        }
+    }
+
+    if( !mbedtls_pk_can_do( &pk, MBEDTLS_PK_RSA ) ) {
+        log_e( "Public key is not an rsa key -0x%x\n\n", -ret );
+        return false;
+    }
+
+
+    const esp_partition_t* partition = esp_ota_get_next_update_partition(NULL);
+   
+    if( !partition ) {
+        log_e( "Could not find update partition!" );
+        return false;
+    }
+
+    const mbedtls_md_info_t *mdinfo = mbedtls_md_info_from_type( MBEDTLS_MD_SHA256 );
+    mbedtls_md_init( &rsa );
+    mbedtls_md_setup( &rsa, mdinfo, 0 );
+    mbedtls_md_starts( &rsa );
+    
+    int bytestoread = SPI_FLASH_SEC_SIZE;
+    int bytesread = 0;
+    int size = firmware_size;
+
+    uint8_t *_buffer = (uint8_t*)malloc(SPI_FLASH_SEC_SIZE);
+    if(!_buffer){
+        log_e( "malloc failed" );
+        return false;
+    }
+    //Serial.printf( "Reading partition (%i sectors, sec_size: %i)\r\n", size, bytestoread );
+    while( bytestoread > 0 ) {
+      //Serial.printf( "Left: %i (%i)               \r", size, bytestoread );
+    
+      if( ESP.partitionRead( partition, bytesread, (uint32_t*)_buffer, bytestoread ) ) {
+	// Debug output for the purpose of comparing with file
+        /*for( int i = 0; i < bytestoread; i++ ) {
+          if( ( i % 16 ) == 0 ) {
+            Serial.printf( "\r\n0x%08x\t", i + bytesread );
+          }
+          Serial.printf( "%02x ", (uint8_t*)_buffer[i] );
+        }*/
+
+        mbedtls_md_update( &rsa, (uint8_t*)_buffer, bytestoread );
+
+        bytesread = bytesread + bytestoread;
+        size = size - bytestoread;
+
+        if( size <= SPI_FLASH_SEC_SIZE ) {
+            bytestoread = size;
+        }
+      } else {
+        log_e( "partitionRead failed!" );
+        return false;
+      }
+    }
+    free( _buffer );
+
+    unsigned char *hash = (unsigned char*)malloc( mdinfo->size );
+    mbedtls_md_finish( &rsa, hash );
+
+    ret = mbedtls_pk_verify( &pk, MBEDTLS_MD_SHA256,
+        hash, mdinfo->size,
+	(unsigned char*)signature, 512
+    );
+
+    free( hash );
+    mbedtls_md_free( &rsa );
+    mbedtls_pk_free( &pk );
+    if( ret == 0 ) {
+        return true;
+    }
+    // overwrite the frist few bytes so this partition won't boot!
+
+    ESP.partitionEraseRange( partition, 0, ENCRYPTED_BLOCK_SIZE);
+
+    return false;
 }
 
 // OTA Logic
@@ -137,6 +232,8 @@ void esp32FOTAGSM::execOTA()
                 if (contentType == "application/octet-stream")
                 {
                     isValidContentType = true;
+                }else{
+                    isValidContentType = true;
                 }
             }
         }
@@ -157,12 +254,20 @@ void esp32FOTAGSM::execOTA()
     // check contentLength and content type
     if (contentLength && isValidContentType)
     {
+        if( _check_sig ) {
+           // If firmware is signed, extract signature and decrease content-length by 512 bytes for signature
+           contentLength = contentLength - 512;
+        }
         // Check if there is enough to OTA Update
         bool canBegin = Update.begin(contentLength);
 
         // If yes, begin
         if (canBegin)
         {
+            unsigned char signature[512];
+            if( _check_sig ) {
+               client.readBytes( signature, 512 );
+            }
             Serial.println("Begin OTA. This may take 2 - 5 mins to complete. Things might be quite for a while.. Patience!");
             // No activity would appear on the Serial monitor
             // So be patient. This may take 2 - 5mins to complete
@@ -181,6 +286,19 @@ void esp32FOTAGSM::execOTA()
 
             if (Update.end())
             {
+                if( _check_sig ) {
+                   if( !validate_sig( signature, contentLength )) {
+                       
+                        const esp_partition_t* partition = esp_ota_get_running_partition();
+                        esp_ota_set_boot_partition( partition );
+
+                        Serial.println( "Signature check failed!" );
+                        ESP.restart();
+                        return;
+                   } else {
+                        Serial.println( "Signature OK" );
+                   }
+                }
                 Serial.println("OTA done!");
                 if (Update.isFinished())
                 {
@@ -233,6 +351,7 @@ bool esp32FOTAGSM::execHTTPcheck()
     _port = 80;
 
     Serial.println("Getting HTTP");
+    Serial.println(checkHOST);
     Serial.println(useURL);
     Serial.println("------");
 	
