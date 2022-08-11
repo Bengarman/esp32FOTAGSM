@@ -245,8 +245,10 @@ void esp32FOTAGSM::execOTA()
         // Probably a choppy network?
         Serial.println("Connection to " + String(_host) + " failed. Please check your setup");
         // retry??
-        // execOTA();
-    }
+        if (_retryCount > 0){
+            _retryCount --;
+            execOTA();
+        }    }
 
     // Check what is the contentLength and if content type is `application/octet-stream`
     Serial.println("contentLength : " + String(contentLength) + ", isValidContentType : " + String(isValidContentType));
@@ -465,6 +467,7 @@ void esp32FOTAGSM::forceUpdate(String firmwareHost, int firmwarePort, String fir
     _host = firmwareHost;
     _bin = firmwarePath;
     _port = firmwarePort;
+    _retryCount = 3;
     execOTA();
 }
 
