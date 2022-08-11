@@ -39,6 +39,7 @@ private:
   String _host;
   String _bin;
   int _port;
+  int _retryCount;
   TinyGsm*	_modem;
 };
 
